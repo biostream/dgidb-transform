@@ -7,99 +7,98 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	// "github.com/golang/protobuf/jsonpb"
 )
 
-type Record struct {
-	ID                string             `json:"id,omitempty"`
-	GeneName          string             `json:"gene_name,omitempty"`
-	EntrezID          int32              `json:"entrez_id,omitempty"`
-	DrugName          string             `json:"drug_name,omitempty"`
-	ChemblID          string             `json:"chembl_id,omitempty"`
-	Publications      []int32            `json:"publications,omitempty"`
-	InteractionTypes  []string           `json:"interaction_types,omitempty"`
-	Sources           []string           `json:"sources,omitempty"`
-	Attributes        []Attribute        `json:"attributes,omitempty"`
-	InteractionClaims []InteractionClaim `json:"interaction_claims,omitempty"`
-}
-
-type Attribute struct {
-	Name    string   `json:"name,omitempty"`
-	Value   string   `json:"value,omitempty"`
-	Sources []string `json:"sources,omitempty"`
-}
-
-type InteractionClaim struct {
-	Source          string      `json:"source,omitempty"`
-	Drug            string      `json:"drug,omitempty"`
-	Gene            string      `json:"gene,omitempty"`
-	IntractionTypes []string    `json:"interaction_types,omitempty"`
-	Attributes      []Attribute `json:"attributes,omitempty"`
-}
-
-// CompoundIDs represents a subset of mappings from:
+// CompoundID represents a subset of mappings from:
 // https://www.ebi.ac.uk/unichem/rest/src_compound_id/{compound_id}/{source_id}
 //
 // Sources described here:
 // https://www.ebi.ac.uk/unichem/ucquery/listSources
-type CompoundID struct {
-	// source_id 1
-	ChEMBL string `json:"chembl,omitempty"`
-	// source_id 22
-	PubChem string `json:"pubchem,omitempty"`
-	// source_id 2
-	DrugBank string `json:"drugbank,omitempty"`
-	// source_id 7
-	ChEBI string `json:"chebi,omitempty"`
+func getCompoundIDs(chemblID string, srcMap map[string]string) (map[string]string, error) {
+	compound := map[string]string{"chembl": chemblID}
+
+	urlTmpl := "https://www.ebi.ac.uk/unichem/rest/src_compound_id/%s/1"
+	respMap, err := httpGet(fmt.Sprintf(urlTmpl, chemblID))	
+	if err != nil {
+		return compound, err
+	}
+
+	for _, v := range respMap {
+		compound[srcMap[v["src_id"]]] = v["src_compound_id"]
+	}
+	
+	urlTmpl = "https://www.ebi.ac.uk/unichem/rest/structure/%s/1"
+	respMap, err = httpGet(fmt.Sprintf(urlTmpl, chemblID))	
+	if err != nil {
+		return compound, err
+	}
+
+	if len(respMap) != 1 {
+		return compound, fmt.Errorf("unexpected response from %s; %v", fmt.Sprintf(urlTmpl, chemblID), respMap) 
+	}
+
+	compound["standardinchi"] = respMap[0]["standardinchi"]
+	compound["standardinchikey"] = respMap[0]["standardinchikey"]
+
+	return compound, nil
 }
 
-func GetCompoundIDs(chemblID string) (*CompoundID, error) {
-	compound := &CompoundID{ChEMBL: chemblID}
+func makeSourceMap() (map[string]string, error) {
+	// src_id -> name
+	srcMap := map[string]string{}
 
-	// example: https://www.ebi.ac.uk/unichem/rest/src_compound_id/CHEMBL12/1
-	tmplURL := "https://www.ebi.ac.uk/unichem/rest/src_compound_id/%s/1"
-	resp, err := http.Get(fmt.Sprintf(tmplURL, chemblID))
+	srcURL := "https://www.ebi.ac.uk/unichem/rest/src_ids/"
+	srcInfoURLTmpl := "https://www.ebi.ac.uk/unichem/rest/sources/%s"
+
+	respMap, err := httpGet(srcURL)
 	if err != nil {
-		return compound, err
+		return nil, err
+	}
+
+	for _, src := range respMap {
+		srcInfo, err := httpGet(fmt.Sprintf(srcInfoURLTmpl, src["src_id"]))	
+		if err != nil {
+			return nil, err
+		}
+		srcMap[src["src_id"]] = srcInfo[0]["name"]
+	}
+
+	return srcMap, nil
+}
+
+func httpGet(url string) ([]map[string]string, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
+
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return compound, err
-	}
-	if resp.StatusCode != 200 {
-		return compound, fmt.Errorf("[STATUS CODE - %d]\t%s", resp.StatusCode, body)
-	}
-	idMap := []map[string]string{}
-	err = json.Unmarshal(body, &idMap)
-	if err != nil {
-		return compound, err
+		return nil, err
 	}
 
-	// https://www.ebi.ac.uk/unichem/ucquery/listSources
-	drugbank := "2"
-	chebi := "7"
-	pubchem := "22"
-	for _, v := range idMap {
-		switch v["src_id"] {
-		case chebi:
-			compound.ChEBI = v["src_compound_id"]
-		case drugbank:
-			compound.DrugBank = v["src_compound_id"]
-		case pubchem:
-			compound.PubChem = v["src_compound_id"]
-		}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("[STATUS CODE - %d]\t%s", resp.StatusCode, body)
 	}
-	return compound, nil
+
+	respMap := []map[string]string{}
+	err = json.Unmarshal(body, &respMap)
+	if err != nil {
+		return nil, err
+	}
+
+	return respMap, nil
 }
 
 func main() {
 	inputFile := ""
 	outputFile := ""
-	flag.StringVar(&inputFile, "interactions", inputFile, "interactions file generated from dgidb-download.go")
+	flag.StringVar(&inputFile, "input", inputFile, "input file containing a ChEMBL ID per line")
 	flag.StringVar(&outputFile, "output", outputFile, "output file path")
 	flag.Parse()
 
@@ -134,18 +133,24 @@ func main() {
 	}
 	defer out.Close()
 
+	srcMap, err := makeSourceMap()
+	if err != nil {
+		panic(err)
+	}
+
+	logger := log.New(os.Stderr, "logger: ", log.Lshortfile)
+
 	writer := json.NewEncoder(out)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		interaction := Record{}
-		err = json.Unmarshal(scanner.Bytes(), &interaction)
+		chemblID := scanner.Text()
+		cid, err := getCompoundIDs(chemblID, srcMap)
 		if err != nil {
-			panic(err)
+			logger.Print(err)
 		}
-		cid, _ := GetCompoundIDs(interaction.ChemblID)
 		err = writer.Encode(cid)
 		if err != nil {
-			panic(err)
+			logger.Print(err)
 		}
 	}
 }
